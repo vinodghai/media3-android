@@ -77,6 +77,8 @@ internal fun ExportOptions(
   onDebugTracingChanged: (Boolean) -> Unit,
   onExport: () -> Unit,
   onCancel: () -> Unit,
+  stressStatus: String? = null,
+  onStressTest: () -> Unit = {},
   modifier: Modifier = Modifier,
 ) {
   val context = LocalContext.current
@@ -176,6 +178,10 @@ internal fun ExportOptions(
         Text(text = stringResource(R.string.export))
       }
     }
+    Button(onClick = onStressTest, modifier = Modifier.fillMaxWidth()) {
+      Text(text = "Stress: 50x (AV1 export, 100ms, cancel)")
+    }
+    stressStatus?.let { Text(text = it) }
     if (exportState.isExporting || exportState.exportResultInfo != null) {
       HorizontalDivider(
         thickness = 2.dp,

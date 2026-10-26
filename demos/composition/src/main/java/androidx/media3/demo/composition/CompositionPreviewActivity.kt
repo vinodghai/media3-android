@@ -127,6 +127,7 @@ private fun CompositionDemoMainScreen(
   uiState: CompositionPreviewState,
   sheetState: SheetState,
 ) {
+  val stressStatus by viewModel.stressStatus.collectAsStateWithLifecycle()
   Scaffold(modifier, snackbarHost = { SnackbarHost(hostState = snackbarHostState) }) { innerPadding
     ->
     CompositionPreviewPane(
@@ -153,6 +154,8 @@ private fun CompositionDemoMainScreen(
           onMuxerOptionChanged = viewModel::onMuxerOptionChanged,
           onDebugTracingChanged = viewModel::enableDebugTracing,
           onExport = viewModel::exportComposition,
+          stressStatus = stressStatus,
+          onStressTest = viewModel::runExportCancelStress,
           onCancel = {
             viewModel.cancelExport()
             onHideSheet()

@@ -16,6 +16,9 @@
 package androidx.media3.demo.composition
 
 import android.app.Application
+import android.media.MediaCodec
+import android.os.Handler
+import android.os.Looper
 import android.net.Uri
 import android.os.Build.VERSION.SDK_INT
 import android.os.SystemClock
@@ -33,6 +36,7 @@ import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
 import androidx.media3.common.Effect
 import androidx.media3.common.MediaItem
+import androidx.media3.common.MimeTypes
 import androidx.media3.common.OverlaySettings
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
@@ -86,7 +90,13 @@ import kotlin.math.cos
 import kotlin.math.roundToInt
 import kotlin.math.sin
 import kotlin.math.sqrt
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
+import kotlin.math.max
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -586,13 +596,16 @@ class CompositionPreviewViewModel(application: Application) : AndroidViewModel(a
     compositionPlayer.play()
   }
 
-  fun exportComposition() {
+  fun exportComposition() = exportComposition(videoMimeTypeOverride = null, compositionOverride = null)
+
+  private fun exportComposition(videoMimeTypeOverride: String?, compositionOverride: Composition?) {
     // Cancel and clean up files from any ongoing export.
     cancelExport()
 
     val composition =
-      if (uiState.value.isCompositionSet) preparedComposition ?: prepareComposition()
-      else prepareComposition()
+      compositionOverride
+        ?: if (uiState.value.isCompositionSet) preparedComposition ?: prepareComposition()
+        else prepareComposition()
     val settings = uiState.value.outputSettingsState
 
     try {
@@ -637,7 +650,9 @@ class CompositionPreviewViewModel(application: Application) : AndroidViewModel(a
       transformerBuilder.setAudioMimeType(settings.audioMimeType)
     }
 
-    if (SAME_AS_INPUT_OPTION != settings.videoMimeType) {
+    if (videoMimeTypeOverride != null) {
+      transformerBuilder.setVideoMimeType(videoMimeTypeOverride)
+    } else if (SAME_AS_INPUT_OPTION != settings.videoMimeType) {
       transformerBuilder.setVideoMimeType(settings.videoMimeType)
     }
 
@@ -732,6 +747,147 @@ class CompositionPreviewViewModel(application: Application) : AndroidViewModel(a
     transformer!!.start(composition, filePath)
     Log.i(TAG, "Export started")
   }
+
+  private val _stressStatus = MutableStateFlow<String?>(null)
+  val stressStatus: StateFlow<String?> = _stressStatus.asStateFlow()
+  private var stressJob: Job? = null
+
+  /**
+   * Repro for the AV1 encoder release deadlock: [STRESS_ITERATIONS] times, starts an AV1 export,
+   * waits [STRESS_INTERVAL_MS], then cancels it. A watchdog thread reports main-thread stalls, and
+   * afterwards a decoder is created on a worker thread to check whether codecs are still usable.
+   */
+  fun runExportCancelStress() {
+    if (stressJob?.isActive == true) return
+    val stressFile = File(getApplication<Application>().getExternalFilesDir(null), STRESS_INPUT_NAME)
+    if (!stressFile.exists()) {
+      _stressStatus.value = "Missing 4K input: adb push portrait_4k60.mp4 ${stressFile.absolutePath}"
+      return
+    }
+    // Experiment hook: files/stress_mime.txt, e.g. video/hevc. Defaults to AV1.
+    val stressMime =
+      File(stressFile.parentFile, "stress_mime.txt").takeIf { it.exists() }?.readText()?.trim()
+        ?: MimeTypes.VIDEO_AV1
+    // Optional override for experiments, without rebuilding: files/stress_interval_ms.txt.
+    val intervalMs =
+      File(stressFile.parentFile, "stress_interval_ms.txt")
+        .takeIf { it.exists() }
+        ?.readText()
+        ?.trim()
+        ?.toLongOrNull() ?: STRESS_INTERVAL_MS
+    val stressComposition =
+      Composition.Builder(
+          EditedMediaItemSequence.Builder(
+              EditedMediaItem.Builder(MediaItem.fromUri(Uri.fromFile(stressFile))).build()
+            )
+            .build()
+        )
+        .build()
+    val mainHandler = Handler(Looper.getMainLooper())
+    stressJob =
+      viewModelScope.launch {
+        val watchdogRunning = AtomicBoolean(true)
+        val lastMainPingMs = AtomicLong(SystemClock.elapsedRealtime())
+        val maxMainStallMs = AtomicLong(0)
+        val ping =
+          object : Runnable {
+            override fun run() {
+              lastMainPingMs.set(SystemClock.elapsedRealtime())
+              if (watchdogRunning.get()) mainHandler.postDelayed(this, WATCHDOG_PING_MS)
+            }
+          }
+        mainHandler.post(ping)
+        val watchdog =
+          Thread({
+              var reportedStall = false
+              while (watchdogRunning.get()) {
+                val stalledMs = SystemClock.elapsedRealtime() - lastMainPingMs.get()
+                maxMainStallMs.accumulateAndGet(stalledMs, ::max)
+                if (stalledMs > MAIN_STALL_THRESHOLD_MS && !reportedStall) {
+                  reportedStall = true
+                  Log.e(TAG, "STRESS WATCHDOG: main thread blocked for >${stalledMs}ms (DEADLOCK?)")
+                } else if (stalledMs <= MAIN_STALL_THRESHOLD_MS) {
+                  reportedStall = false
+                }
+                try {
+                  Thread.sleep(WATCHDOG_PING_MS)
+                } catch (e: InterruptedException) {
+                  return@Thread
+                }
+              }
+            }, "StressWatchdog")
+            .apply { start() }
+        var maxCancelMs = 0L
+        var errors = 0
+        Log.i(TAG, "STRESS START: $STRESS_ITERATIONS x (AV1 export -> ${intervalMs}ms -> cancel), mime=$stressMime")
+        for (i in 1..STRESS_ITERATIONS) {
+          _stressStatus.value = "Stress $i/$STRESS_ITERATIONS (max cancel ${maxCancelMs}ms)"
+          try {
+            val startMs = SystemClock.elapsedRealtime()
+            exportComposition(stressMime, stressComposition)
+            val startedMs = SystemClock.elapsedRealtime() - startMs
+            delay(intervalMs)
+            val cancelStartMs = SystemClock.elapsedRealtime()
+            cancelExport()
+            val cancelMs = SystemClock.elapsedRealtime() - cancelStartMs
+            maxCancelMs = max(maxCancelMs, cancelMs)
+            Log.i(TAG, "STRESS #$i: start=${startedMs}ms cancel=${cancelMs}ms (main thread)")
+          } catch (e: Exception) {
+            errors++
+            Log.e(TAG, "STRESS #$i failed", e)
+          }
+        }
+        Log.i(TAG, "STRESS LOOP DONE: maxCancelMs=$maxCancelMs errors=$errors")
+        _stressStatus.value = "Loop done (max cancel ${maxCancelMs}ms). Probing codecs..."
+        val probe = probeCodecCreation()
+        watchdogRunning.set(false)
+        watchdog.interrupt()
+        mainHandler.removeCallbacks(ping)
+        val result =
+          "Stress done. maxCancelCall=${maxCancelMs}ms maxMainThreadStall=${maxMainStallMs.get()}ms " +
+            "errors=$errors. $probe"
+        Log.i(TAG, "STRESS RESULT: $result")
+        _stressStatus.value = result
+      }
+  }
+
+  /** Creates and releases a video decoder and AV1 encoder on a worker thread, with a timeout. */
+  private suspend fun probeCodecCreation(): String =
+    withContext(Dispatchers.IO) {
+      val results = StringBuilder()
+      for ((label, mime, encoder) in
+        listOf(
+          Triple("H264 decoder", MimeTypes.VIDEO_H264, false),
+          Triple("AV1 encoder", MimeTypes.VIDEO_AV1, true),
+        )) {
+        val done = CountDownLatch(1)
+        val startMs = SystemClock.elapsedRealtime()
+        val thread =
+          Thread({
+              try {
+                val codec =
+                  if (encoder) MediaCodec.createEncoderByType(mime)
+                  else MediaCodec.createDecoderByType(mime)
+                codec.release()
+              } catch (e: Exception) {
+                Log.e(TAG, "STRESS PROBE $label failed", e)
+              } finally {
+                done.countDown()
+              }
+            }, "StressProbe-$label")
+            .apply { start() }
+        val ok = done.await(PROBE_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+        val elapsed = SystemClock.elapsedRealtime() - startMs
+        if (ok) {
+          results.append("$label OK (${elapsed}ms). ")
+        } else {
+          results.append("$label HUNG >${PROBE_TIMEOUT_MS}ms (DEADLOCK). ")
+          Log.e(TAG, "STRESS PROBE: $label creation hung; thread state=${thread.state}")
+          Log.e(TAG, thread.stackTrace.joinToString("\n  at ", "  at "))
+        }
+      }
+      results.toString()
+    }
 
   /** Cancels any ongoing export operation, and deletes output file contents. */
   fun cancelExport() {
@@ -1012,6 +1168,12 @@ class CompositionPreviewViewModel(application: Application) : AndroidViewModel(a
   companion object {
     const val SAME_AS_INPUT_OPTION = "same as input"
     private const val TAG = "CompPreviewVM"
+    private const val STRESS_INPUT_NAME = "stress_4k.mp4"
+    private const val STRESS_ITERATIONS = 50
+    private const val STRESS_INTERVAL_MS = 100L
+    private const val WATCHDOG_PING_MS = 20L
+    private const val MAIN_STALL_THRESHOLD_MS = 150L
+    private const val PROBE_TIMEOUT_MS = 5000L
     private const val AUDIO_URI = "https://storage.googleapis.com/exoplayer-test-media-0/play.mp3"
     private const val DEFAULT_FRAME_RATE_FPS = 30
     // A 3-second moving average window (rather than 1s) is used to smooth out micro-stutters
