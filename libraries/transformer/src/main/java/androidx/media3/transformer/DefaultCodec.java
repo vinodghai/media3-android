@@ -32,6 +32,7 @@ import android.media.MediaCodec;
 import android.media.MediaCodec.BufferInfo;
 import android.media.MediaCrypto;
 import android.media.MediaFormat;
+import android.os.SystemClock;
 import android.view.Surface;
 import androidx.annotation.Nullable;
 import androidx.annotation.RequiresApi;
@@ -62,6 +63,7 @@ public final class DefaultCodec implements Codec {
   public static final int DEFAULT_PCM_ENCODING = C.ENCODING_PCM_16BIT;
 
   private static final String TAG = "DefaultCodec";
+  private static final long RELEASE_DRAIN_TIMEOUT_MS = 1_000;
 
   private final BufferInfo outputBufferInfo;
 
@@ -77,12 +79,13 @@ public final class DefaultCodec implements Codec {
   // Accessed concurrently by playback thread when reading output, and video effects thread
   // when signaling end of stream.
   private final AtomicBoolean videoOutputStarted;
+  private final AtomicBoolean released;
 
   private @MonotonicNonNull Format outputFormat;
   @Nullable private ByteBuffer outputBuffer;
   private int inputBufferIndex;
   private int outputBufferIndex;
-  private boolean inputStreamEnded;
+  private volatile boolean inputStreamEnded;
   private boolean outputStreamEnded;
 
   /**
@@ -114,6 +117,7 @@ public final class DefaultCodec implements Codec {
     inputBufferIndex = C.INDEX_UNSET;
     outputBufferIndex = C.INDEX_UNSET;
     videoOutputStarted = new AtomicBoolean();
+    released = new AtomicBoolean();
     DebugTraceUtil.logCodecEvent(
         isDecoder, isVideo, EVENT_INPUT_FORMAT, C.TIME_UNSET, "%s", configurationFormat);
 
@@ -264,9 +268,14 @@ public final class DefaultCodec implements Codec {
         Thread.currentThread().interrupt();
       }
     }
+    signalEndOfInputStreamWithoutDelay();
+  }
+
+  private void signalEndOfInputStreamWithoutDelay() throws ExportException {
     debugTraceLogEvent(EVENT_INPUT_ENDED, C.TIME_END_OF_SOURCE);
     try {
       mediaCodec.signalEndOfInputStream();
+      inputStreamEnded = true;
     } catch (RuntimeException e) {
       Log.d(TAG, "MediaCodec error", e);
       throw createExportException(e);
@@ -352,11 +361,63 @@ public final class DefaultCodec implements Codec {
 
   @Override
   public void release() {
+    if (!released.compareAndSet(false, true)) {
+      return;
+    }
+    drainBeforeReleaseIfNeeded();
     outputBuffer = null;
     if (inputSurface != null) {
       inputSurface.release();
     }
     mediaCodec.release();
+  }
+
+  /** Drains a hardware video encoder that has not ended, ignoring any failure. */
+  private void drainBeforeReleaseIfNeeded() {
+    try {
+      if (isVideo
+          && !isDecoder
+          && !isEnded()
+          && EncoderUtil.isHardwareAccelerated(
+              mediaCodec.getCodecInfo(), checkNotNull(configurationFormat.sampleMimeType))) {
+        drainBeforeRelease();
+      }
+    } catch (ExportException | RuntimeException e) {
+      Log.w(TAG, "Failed to drain video encoder before release.", e);
+    }
+  }
+
+  /**
+   * Signals end of input and discards output until the encoder reaches end of stream, or {@link
+   * #RELEASE_DRAIN_TIMEOUT_MS} elapses.
+   *
+   * <p>Releasing a surface-input encoder while it is still encoding a frame that it already
+   * accepted can deadlock some vendor encoders (for example {@code c2.google.av1.encoder} on Pixel
+   * 9). Draining first means no frame is in flight when {@link MediaCodec#release()} is called.
+   */
+  private void drainBeforeRelease() throws ExportException {
+    long startTimeMs = SystemClock.elapsedRealtime();
+    long deadlineMs = startTimeMs + RELEASE_DRAIN_TIMEOUT_MS;
+    if (!inputStreamEnded) {
+      // The delay in signalEndOfInputStream() only protects output that is going to be used.
+      signalEndOfInputStreamWithoutDelay();
+    }
+    while (!isEnded()) {
+      long remainingTimeMs = deadlineMs - SystemClock.elapsedRealtime();
+      if (remainingTimeMs <= 0) {
+        Log.w(TAG, "Timed out draining video encoder before release: " + getName());
+        return;
+      }
+      if (maybeDequeueOutputBuffer(
+          /* setOutputBuffer= */ false, /* timeoutUs= */ Util.msToUs(remainingTimeMs))) {
+        releaseOutputBuffer(/* render= */ false);
+      }
+    }
+    Log.d(
+        TAG,
+        Util.formatInvariant(
+            "Drained %s before release in %d ms",
+            getName(), SystemClock.elapsedRealtime() - startTimeMs));
   }
 
   /**
@@ -387,6 +448,11 @@ public final class DefaultCodec implements Codec {
    * @throws ExportException If the underlying {@link MediaCodec} encounters a problem.
    */
   private boolean maybeDequeueOutputBuffer(boolean setOutputBuffer) throws ExportException {
+    return maybeDequeueOutputBuffer(setOutputBuffer, /* timeoutUs= */ 0);
+  }
+
+  private boolean maybeDequeueOutputBuffer(boolean setOutputBuffer, long timeoutUs)
+      throws ExportException {
     if (outputBufferIndex >= 0) {
       return true;
     }
@@ -395,7 +461,7 @@ public final class DefaultCodec implements Codec {
     }
 
     try {
-      outputBufferIndex = mediaCodec.dequeueOutputBuffer(outputBufferInfo, /* timeoutUs= */ 0);
+      outputBufferIndex = mediaCodec.dequeueOutputBuffer(outputBufferInfo, timeoutUs);
     } catch (RuntimeException e) {
       Log.d(TAG, "MediaCodec error", e);
       throw createExportException(e);
