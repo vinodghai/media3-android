@@ -79,6 +79,8 @@ internal fun ExportOptions(
   onCancel: () -> Unit,
   stressStatus: String? = null,
   onStressTest: () -> Unit = {},
+  drainOnRelease: Boolean = false,
+  onDrainOnReleaseChanged: (Boolean) -> Unit = {},
   modifier: Modifier = Modifier,
 ) {
   val context = LocalContext.current
@@ -177,6 +179,14 @@ internal fun ExportOptions(
       Button(onClick = onExport, enabled = !exportState.isExporting) {
         Text(text = stringResource(R.string.export))
       }
+    }
+    Row(
+      verticalAlignment = Alignment.CenterVertically,
+      horizontalArrangement = Arrangement.SpaceBetween,
+      modifier = Modifier.fillMaxWidth(),
+    ) {
+      Text(text = "Drain encoder on release (fix)", modifier = Modifier.textPadding())
+      Switch(checked = drainOnRelease, onCheckedChange = onDrainOnReleaseChanged)
     }
     Button(onClick = onStressTest, modifier = Modifier.fillMaxWidth()) {
       Text(text = "Stress: 50x (AV1 export, 100ms, cancel)")

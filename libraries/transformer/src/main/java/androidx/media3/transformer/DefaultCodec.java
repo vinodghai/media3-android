@@ -32,6 +32,7 @@ import android.media.MediaCodec;
 import android.media.MediaCodec.BufferInfo;
 import android.media.MediaCrypto;
 import android.media.MediaFormat;
+import android.os.SystemClock;
 import android.view.Surface;
 import androidx.annotation.Nullable;
 import androidx.annotation.RequiresApi;
@@ -62,6 +63,9 @@ public final class DefaultCodec implements Codec {
   public static final int DEFAULT_PCM_ENCODING = C.ENCODING_PCM_16BIT;
 
   private static final String TAG = "DefaultCodec";
+  private static final long DRAIN_TIMEOUT_MS = 1_000;
+  private static final long DRAIN_POLL_TIMEOUT_US = 10_000;
+  private static volatile boolean drainVideoEncoderOnRelease;
 
   private final BufferInfo outputBufferInfo;
 
@@ -350,13 +354,59 @@ public final class DefaultCodec implements Codec {
     return outputStreamEnded && outputBufferIndex == C.INDEX_UNSET;
   }
 
+  /**
+   * Sets whether a video encoder is drained before being released.
+   *
+   * <p>When enabled, releasing a surface-input video encoder that has not reached end of stream
+   * first signals end of input and discards output until end of stream, so that no frame is being
+   * encoded when {@link MediaCodec#release()} is called. This works around vendor encoders, such as
+   * {@code c2.google.av1.encoder} on Pixel 9, that deadlock when released while encoding.
+   *
+   * <p>Disabled by default.
+   */
+  public static void setDrainVideoEncoderOnRelease(boolean enabled) {
+    drainVideoEncoderOnRelease = enabled;
+  }
+
   @Override
   public void release() {
     outputBuffer = null;
+    if (drainVideoEncoderOnRelease && !isDecoder && isVideo && inputSurface != null) {
+      drainBeforeRelease();
+    }
     if (inputSurface != null) {
       inputSurface.release();
     }
     mediaCodec.release();
+  }
+
+  private void drainBeforeRelease() {
+    if (outputStreamEnded) {
+      return;
+    }
+    long startMs = SystemClock.elapsedRealtime();
+    boolean ended = false;
+    try {
+      if (outputBufferIndex >= 0) {
+        mediaCodec.releaseOutputBuffer(outputBufferIndex, /* render= */ false);
+        outputBufferIndex = C.INDEX_UNSET;
+      }
+      mediaCodec.signalEndOfInputStream();
+      while (!ended && SystemClock.elapsedRealtime() - startMs < DRAIN_TIMEOUT_MS) {
+        int index = mediaCodec.dequeueOutputBuffer(outputBufferInfo, DRAIN_POLL_TIMEOUT_US);
+        if (index >= 0) {
+          ended = (outputBufferInfo.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0;
+          mediaCodec.releaseOutputBuffer(index, /* render= */ false);
+        }
+      }
+    } catch (RuntimeException e) {
+      Log.d(TAG, "Error draining encoder before release", e);
+    }
+    Log.i(
+        TAG,
+        Util.formatInvariant(
+            "Drained %s before release: ended=%s in %dms",
+            getName(), ended, SystemClock.elapsedRealtime() - startMs));
   }
 
   /**

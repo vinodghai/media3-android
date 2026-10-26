@@ -69,6 +69,7 @@ import androidx.media3.effect.StaticOverlaySettings
 import androidx.media3.effect.ndk.HardwareBufferJni
 import androidx.media3.inspector.MetadataRetriever
 import androidx.media3.transformer.Composition
+import androidx.media3.transformer.DefaultCodec
 import androidx.media3.transformer.CompositionFrameMetadata
 import androidx.media3.transformer.CompositionPlayer
 import androidx.media3.transformer.EditedMediaItem
@@ -751,6 +752,12 @@ class CompositionPreviewViewModel(application: Application) : AndroidViewModel(a
   private val _stressStatus = MutableStateFlow<String?>(null)
   val stressStatus: StateFlow<String?> = _stressStatus.asStateFlow()
   private var stressJob: Job? = null
+  private val _drainOnRelease = MutableStateFlow(false)
+  val drainOnRelease: StateFlow<Boolean> = _drainOnRelease.asStateFlow()
+
+  fun onDrainOnReleaseChanged(enabled: Boolean) {
+    _drainOnRelease.value = enabled
+  }
 
   /**
    * Repro for the AV1 encoder release deadlock: [STRESS_ITERATIONS] times, starts an AV1 export,
@@ -764,6 +771,7 @@ class CompositionPreviewViewModel(application: Application) : AndroidViewModel(a
       _stressStatus.value = "Missing 4K input: adb push portrait_4k60.mp4 ${stressFile.absolutePath}"
       return
     }
+    DefaultCodec.setDrainVideoEncoderOnRelease(_drainOnRelease.value)
     // Experiment hook: files/stress_mime.txt, e.g. video/hevc. Defaults to AV1.
     val stressMime =
       File(stressFile.parentFile, "stress_mime.txt").takeIf { it.exists() }?.readText()?.trim()
@@ -819,7 +827,7 @@ class CompositionPreviewViewModel(application: Application) : AndroidViewModel(a
             .apply { start() }
         var maxCancelMs = 0L
         var errors = 0
-        Log.i(TAG, "STRESS START: $STRESS_ITERATIONS x (AV1 export -> ${intervalMs}ms -> cancel), mime=$stressMime")
+        Log.i(TAG, "STRESS START: $STRESS_ITERATIONS x (AV1 export -> ${intervalMs}ms -> cancel), drain=${_drainOnRelease.value}, mime=$stressMime")
         for (i in 1..STRESS_ITERATIONS) {
           _stressStatus.value = "Stress $i/$STRESS_ITERATIONS (max cancel ${maxCancelMs}ms)"
           try {

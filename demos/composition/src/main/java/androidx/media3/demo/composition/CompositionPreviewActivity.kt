@@ -128,6 +128,7 @@ private fun CompositionDemoMainScreen(
   sheetState: SheetState,
 ) {
   val stressStatus by viewModel.stressStatus.collectAsStateWithLifecycle()
+  val drainOnRelease by viewModel.drainOnRelease.collectAsStateWithLifecycle()
   Scaffold(modifier, snackbarHost = { SnackbarHost(hostState = snackbarHostState) }) { innerPadding
     ->
     CompositionPreviewPane(
@@ -156,6 +157,8 @@ private fun CompositionDemoMainScreen(
           onExport = viewModel::exportComposition,
           stressStatus = stressStatus,
           onStressTest = viewModel::runExportCancelStress,
+          drainOnRelease = drainOnRelease,
+          onDrainOnReleaseChanged = viewModel::onDrainOnReleaseChanged,
           onCancel = {
             viewModel.cancelExport()
             onHideSheet()
