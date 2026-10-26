@@ -81,6 +81,8 @@ internal fun ExportOptions(
   onStressTest: () -> Unit = {},
   drainOnRelease: Boolean = false,
   onDrainOnReleaseChanged: (Boolean) -> Unit = {},
+  cancelOffMainThread: Boolean = false,
+  onCancelOffMainThreadChanged: (Boolean) -> Unit = {},
   modifier: Modifier = Modifier,
 ) {
   val context = LocalContext.current
@@ -187,6 +189,14 @@ internal fun ExportOptions(
     ) {
       Text(text = "Drain encoder on release (fix)", modifier = Modifier.textPadding())
       Switch(checked = drainOnRelease, onCheckedChange = onDrainOnReleaseChanged)
+    }
+    Row(
+      verticalAlignment = Alignment.CenterVertically,
+      horizontalArrangement = Arrangement.SpaceBetween,
+      modifier = Modifier.fillMaxWidth(),
+    ) {
+      Text(text = "Run Transformer (cancel) off main thread", modifier = Modifier.textPadding())
+      Switch(checked = cancelOffMainThread, onCheckedChange = onCancelOffMainThreadChanged)
     }
     Button(onClick = onStressTest, modifier = Modifier.fillMaxWidth()) {
       Text(text = "Stress: 50x (AV1 export, 100ms, cancel)")

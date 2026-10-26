@@ -18,6 +18,7 @@ package androidx.media3.demo.composition
 import android.app.Application
 import android.media.MediaCodec
 import android.os.Handler
+import android.os.HandlerThread
 import android.os.Looper
 import android.net.Uri
 import android.os.Build.VERSION.SDK_INT
@@ -125,6 +126,22 @@ class CompositionPreviewViewModel(application: Application) : AndroidViewModel(a
   internal var frameConsumerEnabled: Boolean = false
   internal var surfaceView: SurfaceView? = null
   private var transformer: Transformer? = null
+  private val exportThread by lazy { HandlerThread("ExportTransformer").apply { start() } }
+  private val _cancelOffMainThread = MutableStateFlow(false)
+  val cancelOffMainThread: StateFlow<Boolean> = _cancelOffMainThread.asStateFlow()
+
+  fun onCancelOffMainThreadChanged(enabled: Boolean) {
+    _cancelOffMainThread.value = enabled
+  }
+
+  /**
+   * Runs [block] on the [Transformer]'s application thread. Blocks posted from one thread run in
+   * order, which preserves the start/cancel ordering the main thread previously gave implicitly.
+   */
+  private fun runOnTransformerThread(t: Transformer, block: () -> Unit) {
+    if (Looper.myLooper() == t.applicationLooper) block()
+    else Handler(t.applicationLooper).post(block)
+  }
   private var outputFile: File? = null
   private var preparedComposition: Composition? = null
   private var playerPrepared: Boolean = false
@@ -668,6 +685,9 @@ class CompositionPreviewViewModel(application: Application) : AndroidViewModel(a
       }
     }
 
+    if (_cancelOffMainThread.value) {
+      transformerBuilder.setLooper(exportThread.looper)
+    }
     transformer =
       transformerBuilder
         .addListener(
@@ -745,7 +765,8 @@ class CompositionPreviewViewModel(application: Application) : AndroidViewModel(a
     }
     exportStopwatch.reset()
     exportStopwatch.start()
-    transformer!!.start(composition, filePath)
+    val startedTransformer = transformer!!
+    runOnTransformerThread(startedTransformer) { startedTransformer.start(composition, filePath) }
     Log.i(TAG, "Export started")
   }
 
@@ -827,7 +848,7 @@ class CompositionPreviewViewModel(application: Application) : AndroidViewModel(a
             .apply { start() }
         var maxCancelMs = 0L
         var errors = 0
-        Log.i(TAG, "STRESS START: $STRESS_ITERATIONS x (AV1 export -> ${intervalMs}ms -> cancel), drain=${_drainOnRelease.value}, mime=$stressMime")
+        Log.i(TAG, "STRESS START: $STRESS_ITERATIONS x (AV1 export -> ${intervalMs}ms -> cancel), drain=${_drainOnRelease.value}, mime=$stressMime, cancelOffMain=${_cancelOffMainThread.value}")
         for (i in 1..STRESS_ITERATIONS) {
           _stressStatus.value = "Stress $i/$STRESS_ITERATIONS (max cancel ${maxCancelMs}ms)"
           try {
@@ -899,10 +920,24 @@ class CompositionPreviewViewModel(application: Application) : AndroidViewModel(a
 
   /** Cancels any ongoing export operation, and deletes output file contents. */
   fun cancelExport() {
-    transformer?.cancel()
+    val cancelledTransformer = transformer
+    val cancelledFile = outputFile
     transformer = null
-    outputFile?.delete()
     outputFile = null
+    if (cancelledTransformer != null) {
+      runOnTransformerThread(cancelledTransformer) {
+        val startMs = SystemClock.elapsedRealtime()
+        cancelledTransformer.cancel()
+        cancelledFile?.delete()
+        Log.i(
+          TAG,
+          "Transformer.cancel() took ${SystemClock.elapsedRealtime() - startMs}ms on " +
+            Thread.currentThread().name,
+        )
+      }
+    } else {
+      cancelledFile?.delete()
+    }
     _uiState.update { it.copy(exportState = ExportState()) }
   }
 

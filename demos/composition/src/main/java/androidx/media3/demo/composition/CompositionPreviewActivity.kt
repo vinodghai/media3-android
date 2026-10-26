@@ -129,6 +129,7 @@ private fun CompositionDemoMainScreen(
 ) {
   val stressStatus by viewModel.stressStatus.collectAsStateWithLifecycle()
   val drainOnRelease by viewModel.drainOnRelease.collectAsStateWithLifecycle()
+  val cancelOffMain by viewModel.cancelOffMainThread.collectAsStateWithLifecycle()
   Scaffold(modifier, snackbarHost = { SnackbarHost(hostState = snackbarHostState) }) { innerPadding
     ->
     CompositionPreviewPane(
@@ -159,6 +160,8 @@ private fun CompositionDemoMainScreen(
           onStressTest = viewModel::runExportCancelStress,
           drainOnRelease = drainOnRelease,
           onDrainOnReleaseChanged = viewModel::onDrainOnReleaseChanged,
+          cancelOffMainThread = cancelOffMain,
+          onCancelOffMainThreadChanged = viewModel::onCancelOffMainThreadChanged,
           onCancel = {
             viewModel.cancelExport()
             onHideSheet()
